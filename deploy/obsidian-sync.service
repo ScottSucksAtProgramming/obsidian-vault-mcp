@@ -1,0 +1,16 @@
+[Unit]
+Description=Obsidian Sync (obsidian-headless, continuous)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vault
+Group=vault
+WorkingDirectory=/home/vault/vault
+ExecStart=/usr/bin/ob sync --continuous
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

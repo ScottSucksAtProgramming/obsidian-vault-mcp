@@ -1,0 +1,32 @@
+[Unit]
+Description=obsidian-vault-mcp (MCP server for an Obsidian vault)
+After=network.target obsidian-sync.service
+
+[Service]
+Type=simple
+User=vault
+Group=vault
+WorkingDirectory=/opt/obsidian-vault-mcp
+# chmod 600, owned by vault. Holds MCP_TOKEN, so keep it unreadable by other users.
+EnvironmentFile=/etc/obsidian-vault-mcp/env
+ExecStart=/usr/bin/node /opt/obsidian-vault-mcp/dist/index.js
+Restart=always
+RestartSec=5
+
+# Hardening. The server only needs to read (and in write mode, write) the vault.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/vault/vault
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

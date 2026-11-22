@@ -1,0 +1,15 @@
+#!/bin/sh
+# Everything that must pass before a commit: types, tests, and a secret scan.
+set -e
+cd "$(dirname "$0")"
+echo "== typecheck"
+npx tsc -p tsconfig.json --noEmit
+echo "== tests"
+npx vitest run
+echo "== gitleaks (working tree)"
+gitleaks dir . --redact --no-banner
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  echo "== gitleaks (git history)"
+  gitleaks git . --redact --no-banner
+fi
+echo "== all checks passed"

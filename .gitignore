@@ -1,0 +1,39 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+
+# Secrets: never commit these
+.env
+*.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+token.txt
+auth_token
+*secret*.json
+*secrets*
+credentials*
+*.credentials
+
+# Local data (Part 2 index and models, logs)
+index/
+models/
+*.sqlite
+*.db
+logs/
+*.log
+
+# Local vault copies (tests use tests/fixtures/vault only)
+/vault/
+/vaults/
+/local-vault/
+
+# OS and editor
+.DS_Store
+.vscode/
+.idea/
