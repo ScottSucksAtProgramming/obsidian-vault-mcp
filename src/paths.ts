@@ -31,6 +31,15 @@ export function checkRelFolder(folder: string | undefined): string {
   return checkRelPath(f);
 }
 
+/** A single file or folder name that Obsidian accepts and that won't break a wikilink. */
+export function checkName(name: string): string {
+  const n = name.trim();
+  if (!n || /[*"\\/<>:|?#^[\]]/.test(n) || n.startsWith('.')) {
+    throw new VaultError(`Name contains characters Obsidian does not allow in file names: '${name}'`);
+  }
+  return n;
+}
+
 export function isInside(dir: string, rel: string): boolean {
   return dir === '' || rel === dir || rel.startsWith(dir + '/');
 }
@@ -66,6 +75,78 @@ export class VaultPaths {
 
   isReadOnly(rel: string): boolean {
     return this.readonlyDirs.some((d) => isInside(d, rel));
+  }
+
+  /** True if a folder is read-only or has a read-only folder somewhere inside it. */
+  touchesReadOnly(rel: string): boolean {
+    return this.isReadOnly(rel) || this.readonlyDirs.some((d) => isInside(rel, d));
+  }
+
+  /**
+   * Resolve the source of a move, rename or delete. It must exist at exactly this path:
+   * no symlink as the item itself or anywhere on the way to it, and not in a read-only folder.
+   */
+  async resolveSource(relInput: string, kind: 'note' | 'folder'): Promise<{ rel: string; abs: string }> {
+    const rel = checkRelPath(relInput);
+    if (kind === 'note' && !rel.toLowerCase().endsWith('.md')) throw new VaultError(`Not a Markdown note: ${rel}`);
+    if (kind === 'folder' ? this.touchesReadOnly(rel) : this.isReadOnly(rel)) throw new VaultError(`Folder is read-only: ${rel}`);
+    const parent = await this.realFolder(path.posix.dirname(rel) === '.' ? '' : path.posix.dirname(rel), rel);
+    const abs = path.join(parent, path.posix.basename(rel));
+    let st;
+    try {
+      st = await fs.lstat(abs);
+    } catch {
+      throw new VaultError(`Not found: ${rel}`);
+    }
+    if (st.isSymbolicLink()) throw new VaultError(`Refusing to move a symlink: ${rel}`);
+    if (kind === 'note' && !st.isFile()) throw new VaultError(`Not a file: ${rel}`);
+    if (kind === 'folder' && !st.isDirectory()) throw new VaultError(`Not a folder: ${rel}`);
+    return { rel, abs };
+  }
+
+  /**
+   * Resolve the destination of a move or rename. Nothing may exist there yet. Every name on the way must be
+   * one Obsidian allows, existing parent folders must be real folders (not symlinks), and none may be read-only.
+   */
+  async resolveDestination(relInput: string): Promise<{ rel: string; abs: string }> {
+    const rel = checkRelPath(relInput);
+    for (const part of rel.split('/')) checkName(part);
+    if (this.isReadOnly(rel)) throw new VaultError(`Folder is read-only: ${rel}`);
+    const parts = rel.split('/');
+    let n = parts.length - 1;
+    // Find the deepest parent folder that exists.
+    while (n > 0) {
+      try {
+        await fs.lstat(path.join(this.root, ...parts.slice(0, n)));
+        break;
+      } catch {
+        n--;
+      }
+    }
+    const real = await this.realFolder(parts.slice(0, n).join('/'), rel);
+    const abs = path.join(real, ...parts.slice(n));
+    try {
+      await fs.lstat(abs);
+    } catch {
+      return { rel, abs };
+    }
+    throw new VaultError(`Already exists: ${rel}`);
+  }
+
+  /** Real path of an existing vault folder, refusing symlinks anywhere on the way and dot folders. */
+  private async realFolder(folderRel: string, forRel: string): Promise<string> {
+    let real: string;
+    try {
+      real = await fs.realpath(path.join(this.root, folderRel));
+    } catch {
+      throw new VaultError(`Not found: ${forRel}`);
+    }
+    const realRel = this.relOf(real);
+    if (realRel === null) throw new VaultError(`Path leads outside the vault: ${forRel}`);
+    if (realRel !== '') checkRelPath(realRel);
+    if (realRel !== folderRel) throw new VaultError(`Path goes through a symlink: ${forRel}`);
+    if (!(await fs.stat(real)).isDirectory()) throw new VaultError(`Parent is not a folder: ${forRel}`);
+    return real;
   }
 
   /**

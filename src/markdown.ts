@@ -12,6 +12,8 @@ export interface RawLink {
   target: string; // path or name, no #fragment
   fragment: string | null;
   line: number;
+  start: number; // offset of the whole link (including any '!') in the text
+  end: number;
 }
 
 export interface ParsedNote {
@@ -116,11 +118,13 @@ export function extractLinks(text: string, startLine = 1): RawLink[] {
   const masked = maskCode(text);
   const links: RawLink[] = [];
   for (const m of masked.matchAll(WIKI_RE)) {
-    const inner = m[2]!.split('|')[0]!;
+    // In tables Obsidian writes the alias separator as '\\|'.
+    const inner = m[2]!.split(/\\?\|/)[0]!;
     const hash = inner.indexOf('#');
     const target = (hash >= 0 ? inner.slice(0, hash) : inner).trim();
     const fragment = hash >= 0 ? inner.slice(hash + 1).trim() : null;
-    links.push({ kind: 'wikilink', embed: m[1] === '!', target, fragment, line: lineAt(masked, m.index!, startLine) });
+    const start = m.index!;
+    links.push({ kind: 'wikilink', embed: m[1] === '!', target, fragment, line: lineAt(masked, start, startLine), start, end: start + m[0].length });
   }
   for (const m of masked.matchAll(MD_LINK_RE)) {
     let href = (m[2] ?? m[3] ?? '').trim();
@@ -134,7 +138,8 @@ export function extractLinks(text: string, startLine = 1): RawLink[] {
     } catch {
       /* keep as written */
     }
-    links.push({ kind: 'markdown', embed: m[1] === '!', target: href, fragment, line: lineAt(masked, m.index!, startLine) });
+    const start = m.index!;
+    links.push({ kind: 'markdown', embed: m[1] === '!', target: href, fragment, line: lineAt(masked, start, startLine), start, end: start + m[0].length });
   }
   return links;
 }

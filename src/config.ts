@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export type AccessMode = 'read' | 'write';
+export type AccessMode = 'read' | 'write' | 'full';
 
 export interface Config {
   vaultDir: string; // absolute realpath
@@ -25,6 +25,7 @@ export interface Config {
   searchMaxResults: number;
   rgPath: string;
   systemctlPath: string;
+  snapshotPath: string; // run before every full-mode change if it exists
 }
 
 export class ConfigError extends Error {}
@@ -62,13 +63,8 @@ function defaultObConfigDir(env: NodeJS.ProcessEnv): string {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const mode = (env.ACCESS_MODE || 'read').trim().toLowerCase();
-  if (mode === 'full') {
-    throw new ConfigError(
-      "ACCESS_MODE=full is reserved for future delete and move tools and is not implemented. Use 'read' or 'write'.",
-    );
-  }
-  if (mode !== 'read' && mode !== 'write') {
-    throw new ConfigError(`ACCESS_MODE must be 'read' or 'write' (got '${mode}')`);
+  if (mode !== 'read' && mode !== 'write' && mode !== 'full') {
+    throw new ConfigError(`ACCESS_MODE must be 'read', 'write' or 'full' (got '${mode}')`);
   }
 
   const vaultRaw = env.VAULT_DIR;
@@ -113,5 +109,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     searchMaxResults: intEnv(env, 'SEARCH_MAX_RESULTS', 200),
     rgPath: env.RG_PATH || 'rg',
     systemctlPath: env.SYSTEMCTL_PATH || 'systemctl',
+    snapshotPath: env.SNAPSHOT_PATH || '/usr/local/bin/vault-snapshot',
   };
 }

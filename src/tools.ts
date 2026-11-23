@@ -26,7 +26,7 @@ interface ToolDef {
   run: (args: any) => Promise<unknown>;
 }
 
-const MODE_RANK: Record<AccessMode, number> = { read: 0, write: 1 };
+const MODE_RANK: Record<AccessMode, number> = { read: 0, write: 1, full: 2 };
 export const allowedIn = (toolMode: AccessMode, serverMode: AccessMode) => MODE_RANK[toolMode] <= MODE_RANK[serverMode];
 
 const folder = z.string().optional().describe("Vault-relative folder to limit results to. Omit for the whole vault.");
@@ -39,6 +39,7 @@ const isContentResult = (v: unknown): v is ToolResult =>
 
 export function toolDefs(ops: Ops, status: StatusChecker, mode: AccessMode): ToolDef[] {
   const cfg = ops.cfg;
+  const canWrite = allowedIn('write', mode);
   const defs: ToolDef[] = [
     {
       name: 'search_notes',
@@ -187,14 +188,14 @@ export function toolDefs(ops: Ops, status: StatusChecker, mode: AccessMode): Too
       name: 'get_daily_note',
       mode: 'read',
       description:
-        mode === 'write'
+        canWrite
           ? "Get the daily note for a date (default today). If it doesn't exist it is created from the daily note template, unless create_if_missing is false. An existing note is never overwritten."
           : 'Get the daily note for a date (default today). Never creates a note in read-only mode.',
       input: z.object({
         date: z.string().optional().describe('YYYY-MM-DD, default today'),
-        ...(mode === 'write' ? { create_if_missing: z.boolean().optional().describe('Default true') } : {}),
+        ...(canWrite ? { create_if_missing: z.boolean().optional().describe('Default true') } : {}),
       }),
-      run: (a) => ops.getDailyNote(a.date, mode === 'write' && a.create_if_missing !== false),
+      run: (a) => ops.getDailyNote(a.date, canWrite && a.create_if_missing !== false),
     },
     {
       name: 'read_daily_notes',
@@ -249,6 +250,39 @@ export function toolDefs(ops: Ops, status: StatusChecker, mode: AccessMode): Too
       }),
       run: (a) => ops.updateProperties(a.path, a.set, a.unset, a.expected_hash),
     },
+    // ---- full mode ----
+    {
+      name: 'move_note',
+      mode: 'full',
+      description:
+        'Move a note to another folder, keeping its file name. Links that would break are rewritten across the vault. Fails if a file with that name is already there.',
+      input: z.object({ path: notePath, folder: z.string().describe("Destination folder, vault-relative. '' means the vault root. Created if missing.") }),
+      run: (a) => ops.mover.moveNote(a.path, a.folder),
+    },
+    {
+      name: 'rename_note',
+      mode: 'full',
+      description:
+        'Rename a note in its folder and update every wikilink, embed and Markdown link that points to it. Fails if a note with the new name exists.',
+      input: z.object({ path: notePath, new_name: z.string().describe("New file name, with or without '.md'. No folders.") }),
+      run: (a) => ops.mover.renameNote(a.path, a.new_name),
+    },
+    {
+      name: 'move_folder',
+      mode: 'full',
+      description:
+        "Move or rename a folder with everything in it. Links that would break are rewritten. Fails if anything exists at new_path.",
+      input: z.object({ path: z.string().describe('Folder to move, vault-relative'), new_path: z.string().describe('New vault-relative folder path') }),
+      run: (a) => ops.mover.moveFolder(a.path, a.new_path),
+    },
+    {
+      name: 'delete_note',
+      mode: 'full',
+      description:
+        "Move a note to the vault's .trash folder (Obsidian's own trash). Nothing is deleted permanently. Links to the note are left as they are.",
+      input: z.object({ path: notePath }),
+      run: (a) => ops.mover.deleteNote(a.path),
+    },
   ];
   return defs;
 }
@@ -261,7 +295,7 @@ export function registerTools(server: McpServer, ops: Ops, status: StatusChecker
       {
         description: def.description,
         inputSchema: def.input,
-        annotations: { readOnlyHint: def.mode === 'read', destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: def.mode === 'read', destructiveHint: def.mode === 'full', openWorldHint: false },
       },
       (async (args: unknown) => runTool(def, args, status, mode)) as never,
     );

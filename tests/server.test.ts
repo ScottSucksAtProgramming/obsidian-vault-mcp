@@ -7,7 +7,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ConfigError, loadConfig } from '../src/config.js';
 import { checkBearer } from '../src/http.js';
 import { buildApp } from '../src/index.js';
-import { activeExec, makeVault, testConfig, TOKEN, type TestVault } from './helpers.js';
+import { runTool, toolDefs } from '../src/tools.js';
+import { activeExec, makeOps, makeVault, testConfig, TOKEN, type TestVault } from './helpers.js';
 
 const READ_TOOLS = [
   'get_backlinks',
@@ -29,6 +30,7 @@ const READ_TOOLS = [
   'vault_status',
 ].sort();
 const WRITE_TOOLS = ['append_to_note', 'create_note', 'replace_in_note', 'update_properties'];
+const FULL_TOOLS = ['delete_note', 'move_folder', 'move_note', 'rename_note'];
 
 let tv: TestVault;
 let close: (() => Promise<void>) | null = null;
@@ -153,19 +155,48 @@ describe('access modes', () => {
     await client.close();
   });
 
-  it('no delete, move or rename tools exist in any mode', async () => {
-    const client = await connect(await start({ ACCESS_MODE: 'write' }));
-    const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names.filter((n) => /delete|move|rename/.test(n))).toEqual([]);
+  it('read and write mode have no delete, move or rename tools', async () => {
+    for (const mode of ['read', 'write']) {
+      const client = await connect(await start({ ACCESS_MODE: mode }));
+      const names = (await client.listTools()).tools.map((t) => t.name);
+      expect(names.filter((n) => /delete|move|rename/.test(n)), mode).toEqual([]);
+      const r = await client.callTool({ name: 'delete_note', arguments: { path: 'Lonely.md' } }).catch(() => ({ isError: true }));
+      expect(r.isError, mode).toBe(true);
+      expect(fs.existsSync(path.join(tv.dir, 'Lonely.md'))).toBe(true);
+      await client.close();
+      await close?.();
+      close = null;
+    }
+  });
+
+  it('full mode adds the full tools on top of the write tools, marked destructive', async () => {
+    const client = await connect(await start({ ACCESS_MODE: 'full' }));
+    const tools = (await client.listTools()).tools;
+    expect(tools.map((t) => t.name).sort()).toEqual([...READ_TOOLS, ...WRITE_TOOLS, ...FULL_TOOLS].sort());
+    for (const t of tools) expect(t.annotations?.destructiveHint ?? false, t.name).toBe(FULL_TOOLS.includes(t.name));
+    const daily = tools.find((t) => t.name === 'get_daily_note')!;
+    expect(Object.keys((daily.inputSchema as { properties?: object }).properties ?? {})).toContain('create_if_missing');
+    const r = await client.callTool({ name: 'move_note', arguments: { path: 'Lonely.md', folder: 'Beds' } });
+    expect(r.isError).toBeFalsy();
+    expect(fs.existsSync(path.join(tv.dir, 'Beds', 'Lonely.md'))).toBe(true);
     await client.close();
   });
 
-  it('full mode refuses to start', () => {
-    expect(() => testConfig(tv.dir, { ACCESS_MODE: 'full' })).toThrow(ConfigError);
-    expect(() => testConfig(tv.dir, { ACCESS_MODE: 'admin' })).toThrow(/must be 'read' or 'write'/);
+  it('the tool runner refuses full tools outside full mode', async () => {
+    const { ops, status } = makeOps(tv.dir, { ACCESS_MODE: 'write' });
+    const def = toolDefs(ops, status, 'write').find((d) => d.name === 'delete_note')!;
+    const r = await runTool(def, { path: 'Lonely.md' }, status, 'write');
+    expect(r.isError).toBe(true);
+    expect(fs.existsSync(path.join(tv.dir, 'Lonely.md'))).toBe(true);
   });
 
-  it('the server process exits with an error in full mode', { timeout: 60000 }, async () => {
+  it('unknown modes are refused', () => {
+    expect(() => testConfig(tv.dir, { ACCESS_MODE: 'admin' })).toThrow(ConfigError);
+    expect(() => testConfig(tv.dir, { ACCESS_MODE: 'admin' })).toThrow(/must be 'read', 'write' or 'full'/);
+    expect(testConfig(tv.dir, { ACCESS_MODE: 'FULL' }).accessMode).toBe('full');
+  });
+
+  it('the server process exits with an error for an unknown mode', { timeout: 60000 }, async () => {
     // Compile to a throwaway folder and run the real entry point.
     const root = path.join(import.meta.dirname, '..');
     const outDir = path.join(tv.base, 'dist');
@@ -180,12 +211,12 @@ describe('access modes', () => {
       execFile(
         process.execPath,
         [entry],
-        { env: { ...process.env, VAULT_DIR: tv.dir, MCP_TOKEN: TOKEN, ACCESS_MODE: 'full', PORT: '0' } },
+        { env: { ...process.env, VAULT_DIR: tv.dir, MCP_TOKEN: TOKEN, ACCESS_MODE: 'admin', PORT: '0' } },
         (err, _out, stderr) => resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stderr: String(stderr) }),
       );
     });
     expect(result.code).toBe(2);
-    expect(result.stderr).toMatch(/ACCESS_MODE=full is reserved/);
+    expect(result.stderr).toMatch(/ACCESS_MODE must be/);
   });
 });
 

@@ -2,7 +2,7 @@
 
 A small, auditable [MCP](https://modelcontextprotocol.io) server that gives an AI client (such as Claude) access to an Obsidian vault. It works directly on the Markdown files on disk, so Obsidian doesn't need to be running. It is meant to run on a small Linux server or container next to [Obsidian Sync's headless client](https://www.npmjs.com/package/obsidian-headless), behind a tunnel or proxy that handles user sign-in.
 
-It is read-only by default. You can turn on a write mode that can create notes and edit them, but it has no tools that delete, move or rename anything.
+It is read-only by default. A `write` mode adds tools that create and edit notes. A `full` mode also adds tools that move, rename and delete notes. Delete only moves a note to the vault's `.trash` folder.
 
 ## Access modes
 
@@ -12,9 +12,9 @@ Set `ACCESS_MODE` before anything else. It decides which tools the server offers
 |---|---|
 | `read` (default) | Search and read notes, images, tags, properties, links and daily notes. Check sync status. Nothing on disk changes. |
 | `write` | Everything in `read`, plus `create_note`, `append_to_note`, `replace_in_note`, `update_properties`, and creating today's daily note from your template when it doesn't exist. |
-| `full` | Reserved. The server refuses to start with it. See [Future work](#future-work). |
+| `full` | Everything in `write`, plus `move_note`, `rename_note`, `move_folder` and `delete_note`. See [Full-mode tools](#full-mode-tools). |
 
-The server enforces the mode itself. In `read` mode the write tools are not registered, so they don't appear in `tools/list`, and a `tools/call` for one is refused whatever the client sends. A second check inside the tool runner refuses any tool above the configured mode.
+The server enforces the mode itself. Tools above the configured mode are not registered. For example, in `read` mode the write tools are not registered, so they don't appear in `tools/list`, and a `tools/call` for one is refused whatever the client sends. A second check inside the tool runner refuses any tool above the configured mode.
 
 ## Tools
 
@@ -49,6 +49,26 @@ Write tools (`write` mode only):
 | `replace_in_note` | Replaces text that must match exactly once. The client must send the note's current hash (from `read_note`), so an edit based on an old copy is refused. |
 | `update_properties` | Sets or removes frontmatter keys. Every other key, the key order and YAML comments stay as they were. |
 
+### Full-mode tools
+
+These are available only in `full` mode. MCP clients see them marked as destructive.
+
+| Tool | What it does |
+|---|---|
+| `move_note` | Moves a note to another folder and keeps its file name. Creates the folder if needed. |
+| `rename_note` | Renames a note in its folder. |
+| `move_folder` | Moves or renames a folder with everything in it. |
+| `delete_note` | Moves a note to the vault's `.trash` folder, where Obsidian keeps deleted files. Nothing is deleted permanently. If `.trash` already has a note with that name, the new one gets a number (`Note 2.md`). Links to the deleted note are left as they are. |
+
+Rules for all four:
+
+- They never overwrite. If anything already exists at the destination, the tool refuses.
+- They refuse paths outside the vault, anything in a dot folder (`.obsidian`, `.trash`, `.git`), symlinks, and anything in `READONLY_DIRS`. A folder that contains a read-only folder can't be moved either. New names can't use characters that break wikilinks (`* " \ / < > : | ? # ^ [ ]`) or start with a dot.
+- Before each change, the server runs the snapshot script at `SNAPSHOT_PATH` (default `/usr/local/bin/vault-snapshot`) with one argument, `Before <tool> <path>`, from the vault folder. The script is expected to commit the vault to git so the change can be rolled back. If the script isn't installed, the change goes ahead and the result says the snapshot was skipped. If it is installed but fails, the change is refused and nothing on disk changes. Refused calls never run the script.
+- Links are kept working. After `move_note`, `rename_note` or `move_folder`, the server checks every wikilink, embed and Markdown link in the vault. Any link that pointed at the moved files and would now point somewhere else (or nowhere) is rewritten. The rewrite keeps `!`, `#heading`, `|alias` and the `.md` extension as they were written. Links that still resolve, such as `[[Note]]` after a move, are left alone. Links that were already broken are left alone.
+- The result lists the notes whose links changed (`links_updated`) and any it could not fix (`links_not_updated`): notes in read-only folders, notes over `READ_MAX_BYTES`, and links that would be ambiguous in every form.
+- Only one full-mode change runs at a time. Each one writes a `move` or `delete` JSON line to the log, plus a `write` line for every note whose links were rewritten.
+
 ### Daily notes
 
 The server reads the Daily Notes core plugin's settings from `<vault>/.obsidian/daily-notes.json` (fields `folder`, `format` and `template`). This file is the only thing it reads inside a dot folder, and no tool exposes it. Obsidian leaves fields out of that file when they're at their defaults, so any missing field falls back to `DAILY_DIR`, `DAILY_FORMAT` or `DAILY_TEMPLATE`, then to Obsidian's defaults (vault root, `YYYY-MM-DD`, no template). The format uses [Moment.js tokens](https://momentjs.com/docs/#/displaying/format/), as Obsidian does. Templates can use `{{date}}`, `{{time}}`, `{{title}}`, `{{date:FORMAT}}` and `{{time:FORMAT}}`.
@@ -65,7 +85,7 @@ Last sync activity comes from the log that `ob sync` writes (`sync/<vault id>/sy
 
 - **Bearer auth on every request.** Every HTTP request must carry `Authorization: Bearer <MCP_TOKEN>`. The server hashes both values and compares them in constant time. Anything else gets a 401. The token must be at least 32 characters.
 - **Loopback only.** The server binds to `127.0.0.1`. Put a tunnel or reverse proxy in front of it. Requests with a `Host` header not in `ALLOWED_HOSTS` get a 403, which blocks DNS-rebinding attacks from a browser.
-- **No delete, move or rename tools.** They aren't built, in any mode.
+- **Delete, move and rename only in `full` mode.** Delete moves the note to `.trash`. Every full-mode change runs the snapshot script first and is refused if the script fails.
 - **Path safety.** Every path is vault-relative. The server rejects absolute paths, `..`, and any dot-prefixed segment (`.obsidian`, `.trash`, `.git`). It resolves the real path and refuses anything outside the vault, including symlinks that lead out or into a dot folder. Writes only go to `.md` files, never through a symlink, and never inside `READONLY_DIRS`.
 - **Safe writes.** Writes go to a temp file and are renamed into place. New notes are created with a hard link, which fails if the file already exists, so a create can never overwrite. One lock per file stops overlapping edits from this server. Reads and writes have size limits.
 - **Write log.** Every write logs the tool, path, byte count and SHA-256 to stdout as one JSON line, so journald keeps an audit trail.
@@ -105,7 +125,7 @@ All settings come from environment variables. `.env.example` lists every one wit
 | `VAULT_DIR` | required | Absolute path to the vault. |
 | `MCP_TOKEN` | required | Bearer token, 32+ characters. |
 | `PORT` | `8787` | Port on 127.0.0.1. |
-| `ACCESS_MODE` | `read` | `read` or `write`. `full` refuses to start. |
+| `ACCESS_MODE` | `read` | `read`, `write` or `full`. |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Accepted `Host` header names. Add your tunnel's public hostname if requests arrive with it. |
 | `READONLY_DIRS` | empty | Comma-separated vault-relative folders that are never written. |
 | `INBOX_DIR` | vault root | Folder for notes created with only a title. |
@@ -119,6 +139,7 @@ All settings come from environment variables. `.env.example` lists every one wit
 | `WRITE_MAX_BYTES` | `1048576` | Largest note the server writes. |
 | `SEARCH_MAX_RESULTS` | `200` | Cap on search results. |
 | `RG_PATH`, `SYSTEMCTL_PATH` | `rg`, `systemctl` | Paths to those programs. |
+| `SNAPSHOT_PATH` | `/usr/local/bin/vault-snapshot` | Script run before every full-mode change. Skipped if missing; a failure refuses the change. |
 
 Folder names are never hardcoded. Every folder the server treats specially comes from these settings or from Obsidian's own daily-notes settings.
 
@@ -209,7 +230,6 @@ Secret scanning: `git config core.hooksPath .githooks` turns on a gitleaks pre-c
 
 ## Future work
 
-- **`full` mode:** delete and move tools, with move rewriting links across the vault the way Obsidian does. Until those exist, `ACCESS_MODE=full` refuses to start so nobody runs it by accident.
 - **Local semantic search:** hybrid keyword and meaning search with a small local embedding model and a SQLite index, plus related-notes suggestions. No outside APIs.
 
 ## License
