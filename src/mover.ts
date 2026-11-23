@@ -175,6 +175,7 @@ export class Mover {
         ...report,
       };
       this.remember(kind, src.rel, dest.rel, await fingerprint(dest.abs, kind), result);
+      t.lap('record');
       this.log(
         JSON.stringify({
           event: 'timing',
@@ -309,7 +310,9 @@ function checkNotePath(rel: string): string {
 
 /**
  * What a moved note or folder holds, to tell whether a retry finds it unchanged: the note's SHA-256, or for a
- * folder the path and SHA-256 of every file in it. Null if it can't be read.
+ * folder the path of every file with the SHA-256 of each note and the size and modified time of everything else
+ * (attachments can be large, and a move keeps their modified time). Dot entries are skipped, as the vault walker
+ * does. Null if it can't be read.
  */
 async function fingerprint(abs: string, kind: 'note' | 'folder'): Promise<string | null> {
   try {
@@ -319,8 +322,12 @@ async function fingerprint(abs: string, kind: 'note' | 'folder'): Promise<string
     for (const e of entries) {
       const full = path.join(e.parentPath, e.name);
       const rel = path.relative(abs, full).split(path.sep).join('/');
-      if (e.isFile()) lines.push(`${rel}\0${sha256(await fs.readFile(full))}`);
-      else if (e.isSymbolicLink()) lines.push(`${rel}\0link:${await fs.readlink(full)}`);
+      if (rel.split('/').some((p) => p.startsWith('.'))) continue;
+      if (e.isFile() && isNotePath(rel)) lines.push(`${rel}\0${sha256(await fs.readFile(full))}`);
+      else if (e.isFile()) {
+        const st = await fs.stat(full);
+        lines.push(`${rel}\0${st.size}:${st.mtimeMs}`);
+      } else if (e.isSymbolicLink()) lines.push(`${rel}\0link:${await fs.readlink(full)}`);
     }
     return sha256(lines.sort().join('\n'));
   } catch {

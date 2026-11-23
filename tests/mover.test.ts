@@ -423,6 +423,16 @@ describe('timing log', () => {
     await ops.mover.renameNote('Beds/Tomato Bed.md', 'Tomato Patch');
     const line = logs.map((l) => JSON.parse(l)).find((l) => l.event === 'timing');
     expect(line).toMatchObject({ tool: 'rename_note', from: 'Beds/Tomato Bed.md', to: 'Beds/Tomato Patch.md', notes_to_fix: 2 });
-    expect(Object.keys(line.ms)).toEqual(['walk', 'plan', 'snapshot', 'move', 'links', 'total']);
+    expect(Object.keys(line.ms)).toEqual(['walk', 'plan', 'snapshot', 'move', 'links', 'record', 'total']);
+  });
+});
+
+describe('retrying a folder move with attachments', () => {
+  it('recognises the retry, and still refuses it when an attachment changed', async () => {
+    const { ops } = full();
+    await ops.mover.moveFolder('Media', 'Pictures');
+    expect(await ops.mover.moveFolder('Media', 'Pictures')).toMatchObject({ already_done: true });
+    fs.appendFileSync(abs('Pictures/photo.jpg'), 'more bytes');
+    await expect(ops.mover.moveFolder('Media', 'Pictures')).rejects.toThrow(/Not found: Media/);
   });
 });
