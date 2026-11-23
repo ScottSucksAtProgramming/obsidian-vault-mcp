@@ -62,6 +62,8 @@ export function testConfig(dir: string, env: Record<string, string> = {}): Confi
     SYNC_UNIT: '',
     OB_CONFIG_DIR: path.join(path.dirname(dir), 'ob-config'),
     STALE_HOURS: '1000000',
+    // Never run a real snapshot script from tests.
+    SNAPSHOT_PATH: path.join(path.dirname(dir), 'no-snapshot-script'),
     ...env,
   });
 }
@@ -74,7 +76,7 @@ export function makeOps(dir: string, env: Record<string, string> = {}, exec: Exe
   const vault = new Vault(paths, cfg.readMaxBytes);
   const logs: string[] = [];
   const writer = new Writer(paths, cfg.writeMaxBytes, (l) => logs.push(l));
-  const ops = new Ops(vault, writer, cfg);
+  const ops = new Ops(vault, writer, cfg, (l) => logs.push(l));
   const status = new StatusChecker(vault, cfg, exec);
   return { cfg, paths, vault, writer, ops, status, logs };
 }

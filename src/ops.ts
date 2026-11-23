@@ -5,6 +5,7 @@ import type { Config } from './config.js';
 import { dailyNotePath, loadDailySettings, parseIsoDate, renderTemplate } from './daily.js';
 import { findSection, normaliseTag, splitFrontmatter } from './markdown.js';
 import { checkRelFolder, checkRelPath, isInside, VaultError } from './paths.js';
+import { Mover } from './mover.js';
 import { LinkResolver, sha256, type LoadedNote, type Vault, type VaultFile } from './vault.js';
 import type { Writer } from './writer.js';
 
@@ -18,11 +19,16 @@ function parseDateArg(value: string, name: string): number {
 }
 
 export class Ops {
+  readonly mover: Mover;
+
   constructor(
     readonly vault: Vault,
     readonly writer: Writer,
     readonly cfg: Config,
-  ) {}
+    log?: (line: string) => void,
+  ) {
+    this.mover = new Mover(vault, writer, cfg, log);
+  }
 
   // ---------- reading ----------
 
@@ -229,7 +235,7 @@ export class Ops {
     } catch (e) {
       if (!(e instanceof VaultError) || !e.message.startsWith('Not found')) throw e;
     }
-    if (!createIfMissing || this.cfg.accessMode !== 'write') {
+    if (!createIfMissing || this.cfg.accessMode === 'read') {
       return { path: rel, exists: false, created: false, settings_source: s.source };
     }
     let content = '';
