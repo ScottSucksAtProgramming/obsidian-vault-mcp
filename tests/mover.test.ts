@@ -336,3 +336,93 @@ describe('snapshot before every change', () => {
     expect(logs.some((l) => l.includes('"event":"snapshot"') && l.includes('script not installed'))).toBe(true);
   });
 });
+
+describe('retrying a change that already happened', () => {
+  const ALREADY = /already moved to .* by an earlier call/;
+
+  it('rename_note: a retry returns success with a note, and changes nothing', async () => {
+    write('Refs.md', REFS);
+    const snap = recordingScript();
+    const { ops, logs } = full({ SNAPSHOT_PATH: snap.script });
+    const first = await ops.mover.renameNote('Beds/Tomato Bed.md', 'Tomato Patch');
+    const refs = read('Refs.md');
+    const moves = logs.filter((l) => l.includes('"event":"move"')).length;
+    const again = await ops.mover.renameNote('Beds/Tomato Bed.md', 'Tomato Patch.md');
+    expect(again).toMatchObject({ ...first, already_done: true, note: expect.stringMatching(ALREADY) });
+    expect(read('Refs.md')).toBe(refs);
+    expect(snap.entries()).toHaveLength(1);
+    expect(logs.filter((l) => l.includes('"event":"move"'))).toHaveLength(moves);
+    expect(logs.some((l) => l.includes('"event":"timing"') && l.includes('"already_done":true'))).toBe(true);
+  });
+
+  it('move_note: a retry returns success with a note', async () => {
+    const { ops } = full();
+    const first = await ops.mover.moveNote('Beds/Pepper Row.md', 'Archive/2026');
+    const again = await ops.mover.moveNote('Beds/Pepper Row.md', 'Archive/2026');
+    expect(again).toMatchObject({ ...first, already_done: true, note: expect.stringMatching(ALREADY) });
+    expect(exists('Archive/2026/Pepper Row.md')).toBe(true);
+  });
+
+  it('move_folder: a retry returns success with a note', async () => {
+    const { ops } = full();
+    const first = await ops.mover.moveFolder('Beds', 'Garden/Beds');
+    const again = await ops.mover.moveFolder('Beds', 'Garden/Beds');
+    expect(again).toMatchObject({ ...first, already_done: true, note: expect.stringMatching(ALREADY) });
+    expect(exists('Garden/Beds/Tomato Bed.md') && !exists('Beds')).toBe(true);
+  });
+
+  it('two identical calls at once: one moves, the other reports it already done', async () => {
+    const snap = recordingScript();
+    const { ops } = full({ SNAPSHOT_PATH: snap.script });
+    const [a, b] = await Promise.all([
+      ops.mover.renameNote('Lonely.md', 'Alone'),
+      ops.mover.renameNote('Lonely.md', 'Alone'),
+    ]);
+    expect([a, b].filter((r) => 'already_done' in r)).toHaveLength(1);
+    expect(exists('Alone.md') && !exists('Lonely.md')).toBe(true);
+    expect(snap.entries()).toHaveLength(1);
+  });
+
+  it('refuses a retry when the moved note has changed since', async () => {
+    const { ops } = full();
+    await ops.mover.renameNote('Lonely.md', 'Alone');
+    write('Alone.md', 'edited after the move\n');
+    await expect(ops.mover.renameNote('Lonely.md', 'Alone')).rejects.toThrow(/Not found: Lonely.md/);
+    expect(read('Alone.md')).toBe('edited after the move\n');
+  });
+
+  it('refuses a folder retry when a file in it has changed or been added', async () => {
+    const { ops } = full();
+    await ops.mover.moveFolder('Beds', 'Garden');
+    write('Garden/New.md', 'new\n');
+    await expect(ops.mover.moveFolder('Beds', 'Garden')).rejects.toThrow(/Not found: Beds/);
+  });
+
+  it('refuses when the source is gone and the target is missing or was never moved there by this server', async () => {
+    const { ops } = full();
+    await ops.mover.renameNote('Lonely.md', 'Alone');
+    fs.renameSync(abs('Alone.md'), abs('Elsewhere.md'));
+    await expect(ops.mover.renameNote('Lonely.md', 'Alone')).rejects.toThrow(/Not found: Lonely.md/);
+    // Seed Catalog was never renamed by this server, even though the target holds the same text.
+    write('Copy.md', read('Seed Catalog.md'));
+    fs.rmSync(abs('Seed Catalog.md'));
+    await expect(ops.mover.renameNote('Seed Catalog.md', 'Copy')).rejects.toThrow(/Not found: Seed Catalog.md/);
+  });
+
+  it('a retry with a different destination is not treated as done', async () => {
+    const { ops } = full();
+    await ops.mover.renameNote('Lonely.md', 'Alone');
+    await expect(ops.mover.renameNote('Lonely.md', 'Solo')).rejects.toThrow(/Not found: Lonely.md/);
+    expect(exists('Solo.md')).toBe(false);
+  });
+});
+
+describe('timing log', () => {
+  it('logs how long each step of a move took', async () => {
+    const { ops, logs } = full();
+    await ops.mover.renameNote('Beds/Tomato Bed.md', 'Tomato Patch');
+    const line = logs.map((l) => JSON.parse(l)).find((l) => l.event === 'timing');
+    expect(line).toMatchObject({ tool: 'rename_note', from: 'Beds/Tomato Bed.md', to: 'Beds/Tomato Patch.md', notes_to_fix: 2 });
+    expect(Object.keys(line.ms)).toEqual(['walk', 'plan', 'snapshot', 'move', 'links', 'total']);
+  });
+});

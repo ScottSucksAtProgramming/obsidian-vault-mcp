@@ -86,4 +86,13 @@ describe('LinkResolver', () => {
     expect(r.resolve('missing', 'Z.md')).toBeNull();
     expect(r.resolve('../../etc/passwd', 'Beds/Note.md')).toBeNull();
   });
+  it('breaks ties between same-named files by shortest path, then alphabetically', () => {
+    const t = new LinkResolver(['b/c/X.md', 'zz/X.md', 'aa/X.md', 'B2/c/x.md', 'X.png', 'Deep/Y.md.md']);
+    expect(t.resolve('X', null)).toBe('aa/X.md');
+    expect(t.resolve('c/x', null)).toBe('b/c/X.md');
+    expect(t.resolve('x.png', null)).toBe('X.png');
+    expect(t.resolve('Y.md', null)).toBe('Deep/Y.md.md');
+    expect(t.resolve('c/', null)).toBeNull();
+    expect(t.resolve('a/X', null)).toBeNull();
+  });
 });

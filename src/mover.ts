@@ -3,12 +3,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Config } from './config.js';
 import { parseNote, type RawLink } from './markdown.js';
-import { checkName, checkRelFolder, isInside, VaultError } from './paths.js';
-import { isNotePath, LinkResolver, type Vault } from './vault.js';
+import { checkName, checkRelFolder, checkRelPath, isInside, VaultError } from './paths.js';
+import { isNotePath, LinkResolver, sha256, type Vault, type VaultFile } from './vault.js';
 import type { Writer } from './writer.js';
 
 const SNAPSHOT_TIMEOUT_MS = 120_000;
 const STRUCTURE_LOCK = '\0structure';
+/** How many finished moves to remember for retries. */
+const DONE_MAX = 200;
 
 interface LinkReport {
   links_updated: { path: string; links: number }[];
@@ -28,33 +30,42 @@ export class Mover {
     private readonly log: (line: string) => void = (l) => console.log(l),
   ) {}
 
+  private done = new Map<string, { print: string; result: object }>();
+
   private get paths() {
     return this.writer.vaultPaths;
   }
 
   async moveNote(pathArg: string, folderArg: string) {
-    const src = await this.paths.resolveSource(pathArg, 'note');
+    const srcRel = checkNotePath(pathArg);
     const folder = checkRelFolder(folderArg);
-    const destRel = folder ? `${folder}/${path.posix.basename(src.rel)}` : path.posix.basename(src.rel);
-    if (destRel === src.rel) throw new VaultError(`Note is already in that folder: ${src.rel}`);
-    return this.relocate('move_note', src, destRel, 'note');
+    const destRel = folder ? `${folder}/${path.posix.basename(srcRel)}` : path.posix.basename(srcRel);
+    if (destRel === srcRel) throw new VaultError(`Note is already in that folder: ${srcRel}`);
+    return this.relocate('move_note', srcRel, destRel, 'note');
   }
 
   async renameNote(pathArg: string, newName: string) {
-    const src = await this.paths.resolveSource(pathArg, 'note');
+    const srcRel = checkNotePath(pathArg);
     const name = checkName(newName.replace(/\.md$/i, ''));
-    const dir = path.posix.dirname(src.rel);
+    const dir = path.posix.dirname(srcRel);
     const destRel = `${dir === '.' ? '' : dir + '/'}${name}.md`;
-    if (destRel === src.rel) throw new VaultError(`Note already has that name: ${src.rel}`);
-    return this.relocate('rename_note', src, destRel, 'note');
+    if (destRel === srcRel) throw new VaultError(`Note already has that name: ${srcRel}`);
+    return this.relocate('rename_note', srcRel, destRel, 'note');
   }
 
   async moveFolder(pathArg: string, newPathArg: string) {
-    const src = await this.paths.resolveSource(pathArg, 'folder');
+    const srcRel = checkRelPath(pathArg);
     const destRel = checkRelFolder(newPathArg);
     if (destRel === '') throw new VaultError('new_path is required; the vault root already exists');
-    if (isInside(src.rel, destRel)) throw new VaultError(`Cannot move a folder into itself: ${src.rel} -> ${destRel}`);
-    return this.relocate('move_folder', src, destRel, 'folder');
+    if (isInside(srcRel, destRel)) throw new VaultError(`Cannot move a folder into itself: ${srcRel} -> ${destRel}`);
+    return this.relocate('move_folder', srcRel, destRel, 'folder');
+  }
+
+  /** Read every note into the vault's cache ahead of the first move, so that move doesn't pay for it. */
+  async warm() {
+    const start = performance.now();
+    const notes = await this.vault.loadAllNotes();
+    this.log(JSON.stringify({ event: 'timing', tool: 'warm_link_index', notes: notes.length, ms: { total: Math.round(performance.now() - start) } }));
   }
 
   async deleteNote(pathArg: string) {
@@ -91,9 +102,23 @@ export class Mover {
     });
   }
 
-  /** Move a note or folder to destRel, then fix every link the move would otherwise break. */
-  private async relocate(tool: string, src: { rel: string; abs: string }, destRel: string, kind: 'note' | 'folder') {
+  /**
+   * Move a note or folder to destRel, then fix every link the move would otherwise break.
+   * If the source is gone and destRel holds exactly what an earlier call moved there, report the earlier result
+   * instead of failing, so a client that lost the connection can safely retry.
+   */
+  private async relocate(tool: string, srcRel: string, destRel: string, kind: 'note' | 'folder') {
     return this.writer.withLock(STRUCTURE_LOCK, async () => {
+      const t = new Timer();
+      let src: { rel: string; abs: string };
+      try {
+        src = await this.paths.resolveSource(srcRel, kind);
+      } catch (e) {
+        const done = e instanceof VaultError && e.message.startsWith('Not found') ? await this.alreadyDone(kind, srcRel, destRel) : null;
+        if (!done) throw e;
+        this.log(JSON.stringify({ event: 'timing', tool, from: srcRel, to: destRel, already_done: true, ms: t.done() }));
+        return done;
+      }
       const dest = await this.paths.resolveDestination(destRel);
       const newRel = (rel: string) =>
         rel === src.rel ? dest.rel : kind === 'folder' && isInside(src.rel, rel) ? dest.rel + rel.slice(src.rel.length) : rel;
@@ -102,9 +127,15 @@ export class Mover {
       const files = await this.vault.listFiles();
       const before = new LinkResolver(files.map((f) => f.rel));
       const after = new LinkResolver(files.map((f) => newRel(f.rel)));
-      const notes = (await this.vault.listNotes()).filter((f) => f.abs === path.join(this.paths.root, ...f.rel.split('/')));
+      const notes = files.filter((f) => f.isNote && f.abs === path.join(this.paths.root, ...f.rel.split('/')));
+      t.lap('walk');
+
+      // Find the notes that need link changes, from the vault's note cache (only changed notes are read again).
+      const { todo, report } = await this.planLinks(notes, before, after, newRel);
+      t.lap('plan');
 
       const snapshot = await this.snapshot(tool, src.rel);
+      t.lap('snapshot');
       await fs.mkdir(path.dirname(dest.abs), { recursive: true });
       let moved = 0;
       if (kind === 'note') {
@@ -132,49 +163,75 @@ export class Mover {
         moved = files.filter((f) => isInside(src.rel, f.rel)).length;
       }
       this.log(JSON.stringify({ event: 'move', tool, from: src.rel, to: dest.rel }));
+      t.lap('move');
 
-      const report = await this.fixLinks(tool, notes, before, after, newRel);
-      return {
+      await this.fixLinks(tool, todo, before, after, newRel, report);
+      t.lap('links');
+      const result = {
         from: src.rel,
         to: dest.rel,
         ...(kind === 'folder' ? { files_moved: moved } : {}),
         snapshot,
         ...report,
       };
+      this.remember(kind, src.rel, dest.rel, await fingerprint(dest.abs, kind), result);
+      this.log(
+        JSON.stringify({
+          event: 'timing',
+          tool,
+          from: src.rel,
+          to: dest.rel,
+          notes_scanned: notes.length,
+          notes_to_fix: todo.length,
+          ms: t.done(),
+        }),
+      );
+      return result;
     });
   }
 
   /**
-   * Rewrite links whose target would change because of the move. A link is rewritten only if it resolved
-   * before the move and now resolves somewhere else. Links that never resolved are left alone.
+   * Work out which notes have links whose target would change because of the move. A link needs a change only if
+   * it resolved before the move and would now resolve somewhere else. Links that never resolved are left alone.
    */
-  private async fixLinks(
-    tool: string,
-    notes: { rel: string; size: number }[],
-    before: LinkResolver,
-    after: LinkResolver,
-    newRel: (rel: string) => string,
-  ): Promise<LinkReport> {
+  private async planLinks(notes: VaultFile[], before: LinkResolver, after: LinkResolver, newRel: (rel: string) => string) {
     const report: LinkReport = { links_updated: [], links_not_updated: [] };
+    const todo: string[] = [];
     for (const note of notes) {
-      const oldSrc = note.rel;
-      const newSrc = newRel(oldSrc);
-      const plan = (text: string) => planEdits(text, oldSrc, newSrc, before, after, newRel);
+      const newSrc = newRel(note.rel);
       if (note.size > this.cfg.readMaxBytes) {
         report.links_not_updated.push({ path: newSrc, reason: 'note is larger than READ_MAX_BYTES, links not checked' });
         continue;
       }
+      let loaded;
       try {
-        const target = await this.paths.resolveForWrite(newSrc).catch(async (e) => {
-          // A read-only note can't be rewritten. Say so only if it actually has links to fix.
-          const p = plan(await fs.readFile(path.join(this.paths.root, ...newSrc.split('/')), 'utf8'));
-          if (p.edits.length + p.stuck > 0) throw e;
-          return null;
-        });
-        if (!target) continue;
+        loaded = await this.vault.loadNote(note);
+      } catch {
+        report.links_not_updated.push({ path: newSrc, reason: 'could not read this note' });
+        continue;
+      }
+      const { edits, stuck } = planEdits(loaded.text, loaded.parsed.links, note.rel, newSrc, before, after, newRel);
+      if (edits.length + stuck > 0) todo.push(note.rel);
+    }
+    return { todo, report };
+  }
+
+  /** Rewrite the links in each note that planLinks picked, re-reading the note from disk under its lock. */
+  private async fixLinks(
+    tool: string,
+    todo: string[],
+    before: LinkResolver,
+    after: LinkResolver,
+    newRel: (rel: string) => string,
+    report: LinkReport,
+  ) {
+    for (const oldSrc of todo) {
+      const newSrc = newRel(oldSrc);
+      try {
+        const target = await this.paths.resolveForWrite(newSrc);
         const result = await this.writer.withLock(target.rel, async () => {
           const text = await fs.readFile(target.abs, 'utf8');
-          const { edits, stuck } = plan(text);
+          const { edits, stuck } = planEdits(text, parseNote(text).links, oldSrc, newSrc, before, after, newRel);
           if (edits.length === 0) return { changed: 0, stuck };
           let next = text;
           for (const e of [...edits].sort((a, b) => b.start - a.start)) next = next.slice(0, e.start) + e.text + next.slice(e.end);
@@ -189,7 +246,33 @@ export class Mover {
         report.links_not_updated.push({ path: newSrc, reason });
       }
     }
-    return report;
+  }
+
+  /** Remember a finished move so a retry of the same call can be recognised. Keeps the most recent ones. */
+  private remember(kind: string, from: string, to: string, print: string | null, result: object) {
+    if (print === null) return;
+    const key = `${kind}\0${from}\0${to}`;
+    this.done.delete(key);
+    this.done.set(key, { print, result });
+    while (this.done.size > DONE_MAX) this.done.delete(this.done.keys().next().value!);
+  }
+
+  /** The earlier result, if this exact move already happened and the destination still has the same content. */
+  private async alreadyDone(kind: 'note' | 'folder', from: string, to: string) {
+    const rec = this.done.get(`${kind}\0${from}\0${to}`);
+    if (!rec) return null;
+    let dest;
+    try {
+      dest = await this.paths.resolveSource(to, kind);
+    } catch {
+      return null;
+    }
+    if ((await fingerprint(dest.abs, kind)) !== rec.print) return null;
+    return {
+      ...rec.result,
+      already_done: true,
+      note: `This ${kind === 'note' ? 'note' : 'folder'} was already moved to ${to} by an earlier call, and its content is unchanged. Nothing was changed this time. The link report is from that earlier call.`,
+    };
   }
 
   /** Run the snapshot script if it is installed. Refuse the change if it is installed but fails. */
@@ -214,6 +297,51 @@ export class Mover {
     });
     this.log(JSON.stringify({ event: 'snapshot', message }));
     return 'taken';
+  }
+}
+
+/** A note path from the client: vault-relative and ending in .md. */
+function checkNotePath(rel: string): string {
+  const r = checkRelPath(rel);
+  if (!r.toLowerCase().endsWith('.md')) throw new VaultError(`Not a Markdown note: ${r}`);
+  return r;
+}
+
+/**
+ * What a moved note or folder holds, to tell whether a retry finds it unchanged: the note's SHA-256, or for a
+ * folder the path and SHA-256 of every file in it. Null if it can't be read.
+ */
+async function fingerprint(abs: string, kind: 'note' | 'folder'): Promise<string | null> {
+  try {
+    if (kind === 'note') return sha256(await fs.readFile(abs));
+    const entries = await fs.readdir(abs, { recursive: true, withFileTypes: true });
+    const lines: string[] = [];
+    for (const e of entries) {
+      const full = path.join(e.parentPath, e.name);
+      const rel = path.relative(abs, full).split(path.sep).join('/');
+      if (e.isFile()) lines.push(`${rel}\0${sha256(await fs.readFile(full))}`);
+      else if (e.isSymbolicLink()) lines.push(`${rel}\0link:${await fs.readlink(full)}`);
+    }
+    return sha256(lines.sort().join('\n'));
+  } catch {
+    return null;
+  }
+}
+
+/** Milliseconds spent in each step of a change, for the timing log line. */
+class Timer {
+  private start = performance.now();
+  private last = this.start;
+  private laps: Record<string, number> = {};
+
+  lap(name: string) {
+    const now = performance.now();
+    this.laps[name] = Math.round(now - this.last);
+    this.last = now;
+  }
+
+  done() {
+    return { ...this.laps, total: Math.round(performance.now() - this.start) };
   }
 }
 
@@ -244,6 +372,7 @@ interface Edit {
 /** Work out the link rewrites one note needs after a move. */
 function planEdits(
   text: string,
+  links: RawLink[],
   oldSrc: string,
   newSrc: string,
   before: LinkResolver,
@@ -253,7 +382,7 @@ function planEdits(
   const edits: Edit[] = [];
   let stuck = 0;
   let lastEnd = -1;
-  for (const link of parseNote(text).links.sort((a, b) => a.start - b.start)) {
+  for (const link of [...links].sort((a, b) => a.start - b.start)) {
     if (!link.target || link.start < lastEnd) continue;
     const was = before.resolve(link.target, oldSrc);
     if (was === null) continue;
