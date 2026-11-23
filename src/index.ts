@@ -28,9 +28,11 @@ function main() {
     }
     throw e;
   }
-  const { server } = buildApp(cfg);
+  const { server, ops } = buildApp(cfg);
   server.listen(cfg.port, cfg.host, () => {
     console.log(JSON.stringify({ event: 'start', mode: cfg.accessMode, host: cfg.host, port: cfg.port }));
+    // Read every note once now, so the first move or rename doesn't have to.
+    if (cfg.accessMode === 'full') ops.mover.warm().catch((e) => console.error('warming the link index failed:', e));
   });
   const stop = () => server.close(() => process.exit(0));
   process.on('SIGTERM', stop);

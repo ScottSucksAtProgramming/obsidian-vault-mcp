@@ -146,11 +146,18 @@ export class Vault {
  */
 export class LinkResolver {
   private byLower = new Map<string, string>();
-  private all: string[];
+  /** Lowercased file name -> [lowercased path, path]. A suffix match always ends in the same file name. */
+  private byName = new Map<string, [string, string][]>();
 
   constructor(files: string[]) {
-    this.all = files;
-    for (const f of files) this.byLower.set(f.toLowerCase(), f);
+    for (const f of files) {
+      const fl = f.toLowerCase();
+      this.byLower.set(fl, f);
+      const name = fl.slice(fl.lastIndexOf('/') + 1);
+      const bucket = this.byName.get(name);
+      if (bucket) bucket.push([fl, f]);
+      else this.byName.set(name, [[fl, f]]);
+    }
   }
 
   resolve(target: string, sourceRel: string | null): string | null {
@@ -178,10 +185,10 @@ export class LinkResolver {
     // Shortest path whose trailing segments match.
     let best: string | null = null;
     for (const c of candidates(norm)) {
-      const suffix = '/' + c.toLowerCase();
-      for (const f of this.all) {
-        const fl = f.toLowerCase();
-        if (fl.endsWith(suffix) || fl === c.toLowerCase()) {
+      const cl = c.toLowerCase();
+      const suffix = '/' + cl;
+      for (const [fl, f] of this.byName.get(cl.slice(cl.lastIndexOf('/') + 1)) ?? []) {
+        if (fl.endsWith(suffix) || fl === cl) {
           if (best === null || f.length < best.length || (f.length === best.length && f < best)) best = f;
         }
       }
